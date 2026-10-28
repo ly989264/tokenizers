@@ -1388,6 +1388,8 @@ where
                     .added_vocabulary
                     .extract_and_normalize(self.normalizer.as_ref(), sequence);
                 let (original, pieces) = normalized.into_pieces(SPLIT_PARALLEL_PIECE_LEN);
+                // If several pieces fail, which error is returned is not
+                // deterministic (the sequential path returns the first one).
                 let pieces = pieces
                     .into_maybe_par_iter()
                     .map(|mut piece| {

@@ -61,8 +61,22 @@ impl PreTokenizer for PreTokenizerWrapper {
     }
 
     fn splits_independently(&self) -> bool {
-        // Every built-in pre-tokenizer works split by split.
-        true
+        // Every built-in pre-tokenizer works split by split (listed one by one
+        // so that a new variant has to be considered here).
+        match self {
+            Self::BertPreTokenizer(_)
+            | Self::ByteLevel(_)
+            | Self::Delimiter(_)
+            | Self::Metaspace(_)
+            | Self::Whitespace(_)
+            | Self::Punctuation(_)
+            | Self::Sequence(_)
+            | Self::Split(_)
+            | Self::WhitespaceSplit(_)
+            | Self::Digits(_)
+            | Self::UnicodeScripts(_)
+            | Self::FixedLength(_) => true,
+        }
     }
 }
 
