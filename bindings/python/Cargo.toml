@@ -39,3 +39,7 @@ default = ["ext-module", "abi3", "parity-aware-bpe"]
 ext-module = ["pyo3/extension-module"]
 abi3 = ["pyo3/abi3", "pyo3/abi3-py310"]
 parity-aware-bpe = ["tokenizers/parity-aware-bpe"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
