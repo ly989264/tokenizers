@@ -6,6 +6,47 @@ use tk::utils::truncation::TruncationDirection;
 use tokenizers as tk;
 
 use crate::error::{deprecation_warning, PyError};
+use std::sync::Mutex;
+
+/// Python `int` objects for the values `u32_list` puts in lists, created on
+/// first use and shared by every list, so a list element costs a reference
+/// count increment instead of allocating (and later freeing) an `int`.
+/// Grows to the largest value seen: a few MiB for a typical vocabulary.
+static INTERNED_INTS: Mutex<Vec<Py<PyAny>>> = Mutex::new(Vec::new());
+
+/// Values at or above this are converted without interning.
+const INTERN_LIMIT: usize = 1 << 20;
+
+/// `values` as a Python `list[int]`.
+///
+/// transformers reads `ids`, `type_ids` and `attention_mask` of every encoding.
+fn u32_list<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyList>> {
+    // Masks and type ids are usually one repeated value: a C-level `[v] * n`.
+    if let Some(&first) = values.first() {
+        if values.iter().all(|&v| v == first) {
+            let one = PyList::new(py, [first])?;
+            return Ok(one
+                .as_sequence()
+                .repeat(values.len())?
+                .into_any()
+                .cast_into()?);
+        }
+    }
+    let max = values.iter().copied().max().unwrap_or(0) as usize;
+    if max >= INTERN_LIMIT {
+        return PyList::new(py, values);
+    }
+    // Building the list can run the garbage collector, and a finalizer could
+    // read another encoding's ids: never wait for the lock.
+    let Ok(mut ints) = INTERNED_INTS.try_lock() else {
+        return PyList::new(py, values);
+    };
+    while ints.len() <= max {
+        let next = ints.len() as u32;
+        ints.push(next.into_pyobject(py)?.into_any().unbind());
+    }
+    PyList::new(py, values.iter().map(|&v| ints[v as usize].bind(py)))
+}
 
 /// The :class:`~tokenizers.Encoding` represents the output of a :class:`~tokenizers.Tokenizer`.
 ///
@@ -131,8 +172,8 @@ impl PyEncoding {
     /// Returns:
     ///     :obj:`List[int]`: The list of IDs
     #[getter]
-    fn get_ids(&self) -> Vec<u32> {
-        self.encoding.get_ids().to_vec()
+    fn get_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        u32_list(py, self.encoding.get_ids())
     }
 
     /// The generated tokens
@@ -210,8 +251,8 @@ impl PyEncoding {
     /// Returns:
     ///     :obj:`List[int]`: The list of type ids
     #[getter]
-    fn get_type_ids(&self) -> Vec<u32> {
-        self.encoding.get_type_ids().to_vec()
+    fn get_type_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        u32_list(py, self.encoding.get_type_ids())
     }
 
     /// The offsets associated to each token
@@ -233,8 +274,8 @@ impl PyEncoding {
     /// Returns:
     ///     :obj:`List[int]`: The special tokens mask
     #[getter]
-    fn get_special_tokens_mask(&self) -> Vec<u32> {
-        self.encoding.get_special_tokens_mask().to_vec()
+    fn get_special_tokens_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        u32_list(py, self.encoding.get_special_tokens_mask())
     }
 
     /// The attention mask
@@ -246,8 +287,8 @@ impl PyEncoding {
     /// Returns:
     ///    :obj:`List[int]`: The attention mask
     #[getter]
-    fn get_attention_mask(&self) -> Vec<u32> {
-        self.encoding.get_attention_mask().to_vec()
+    fn get_attention_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        u32_list(py, self.encoding.get_attention_mask())
     }
 
     /// A :obj:`List` of overflowing :class:`~tokenizers.Encoding`
