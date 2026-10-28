@@ -30,18 +30,7 @@ impl Normalizer for ByteLevel {
     /// Strip the normalized string inplace
     fn normalize(&self, normalized: &mut NormalizedString) -> Result<()> {
         if !normalized.is_empty() {
-            let s = normalized.get();
-            let mut transformations: Vec<(char, isize)> = Vec::with_capacity(s.len());
-            for (i, cur_char) in s.char_indices() {
-                let size = cur_char.len_utf8();
-                transformations.extend(
-                    s.as_bytes()[i..i + size]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, b)| (BYTES_CHAR[b], isize::from(i > 0))),
-                );
-            }
-            normalized.transform(transformations, 0);
+            normalized.map_bytes_to_chars(|b| BYTES_CHAR[&b]);
         }
         Ok(())
     }
