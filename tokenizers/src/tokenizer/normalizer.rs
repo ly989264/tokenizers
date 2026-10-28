@@ -445,6 +445,59 @@ impl NormalizedString {
         self.transform_range(Range::Original(..), dest, initial_offset)
     }
 
+    /// Replaces every byte of the normalized string with the char `f(byte)`
+    /// (what the byte-level pre-tokenizer and normalizer do).
+    ///
+    /// Same result as `transform` with `(f(b), 0)` for the first byte of each
+    /// char and `(f(b), 1)` for the others, but the new string and alignments
+    /// are written in one pass with their exact sizes.
+    pub fn map_bytes_to_chars<F>(&mut self, f: F)
+    where
+        F: Fn(u8) -> char,
+    {
+        let n_range = match self.convert_offsets(Range::Original(..)) {
+            Some(range) => range,
+            None => return,
+        };
+        let bytes = self.normalized.as_bytes();
+        if n_range != (0..bytes.len()) {
+            let transformations = self
+                .normalized
+                .char_indices()
+                .flat_map(|(i, c)| {
+                    bytes[i..i + c.len_utf8()]
+                        .iter()
+                        .enumerate()
+                        .map(|(j, b)| (f(*b), isize::from(j > 0)))
+                })
+                .collect::<Vec<_>>();
+            self.transform(transformations, 0);
+            return;
+        }
+
+        let len: usize = bytes.iter().map(|b| f(*b).len_utf8()).sum();
+        let mut normalized = String::with_capacity(len);
+        let mut alignments = Vec::with_capacity(len);
+        for (i, c) in self.normalized.char_indices() {
+            let size = c.len_utf8();
+            for (j, b) in bytes[i..i + size].iter().enumerate() {
+                let new_char = f(*b);
+                // The first byte replaces the char and keeps its alignment; the
+                // others are inserted after it and take the alignment of its
+                // last byte, as `transform` does.
+                let align = if j == 0 {
+                    self.alignments[i]
+                } else {
+                    self.alignments[i + size - 1]
+                };
+                normalized.push(new_char);
+                alignments.extend(std::iter::repeat_n(align, new_char.len_utf8()));
+            }
+        }
+        self.normalized = normalized;
+        self.alignments = alignments;
+    }
+
     /// Applies NFD normalization
     pub fn nfd(&mut self) -> &mut Self {
         self.transform(self.get().to_owned().nfd(), 0);
@@ -1024,6 +1077,43 @@ mod tests {
     use super::*;
     use regex::Regex;
     use unicode_categories::UnicodeCategories;
+
+    #[test]
+    fn map_bytes_to_chars_matches_transform() {
+        let table = crate::pre_tokenizers::byte_level::bytes_char();
+        let f = |b: u8| table[&b];
+        let mut cases: Vec<NormalizedString> = vec![];
+        for s in ["", "a", "Hello world", "élégant", "日本語 text", "a👍🏽b", "e\u{301}x", " \t\n "] {
+            cases.push(NormalizedString::from(s));
+            let mut n = NormalizedString::from(s);
+            n.nfd();
+            cases.push(n);
+            let mut n = NormalizedString::from(s);
+            n.prepend("▁").filter(|c| c != 'e');
+            cases.push(n);
+            let mut n = NormalizedString::from(format!("  {s}  ").as_str());
+            n.strip();
+            cases.push(n);
+            let n = NormalizedString::from(format!("xx{s}yy").as_str());
+            if let Some(n) = n.slice(Range::Original(1..n.len_original() - 1)) {
+                cases.push(n);
+            }
+        }
+        for case in cases {
+            let mut expected = case.clone();
+            let s = expected.get().to_owned();
+            let mut transformations = vec![];
+            for (i, c) in s.char_indices() {
+                for (j, b) in s.as_bytes()[i..i + c.len_utf8()].iter().enumerate() {
+                    transformations.push((f(*b), isize::from(j > 0)));
+                }
+            }
+            expected.transform(transformations, 0);
+            let mut got = case.clone();
+            got.map_bytes_to_chars(f);
+            assert_eq!(got, expected, "{case:?}");
+        }
+    }
 
     #[test]
     fn test_len_range_inclusive() {
