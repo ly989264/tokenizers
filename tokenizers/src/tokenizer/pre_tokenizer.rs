@@ -126,6 +126,42 @@ impl PreTokenizedString {
         Ok(())
     }
 
+    /// Cuts the splits into pieces of consecutive splits, each holding at least
+    /// `min_len` bytes of normalized text (the last one may hold less), so the
+    /// pieces can be pre-tokenized and tokenized independently. Returns the
+    /// original string, which `from_pieces` needs to put them back together.
+    pub(crate) fn into_pieces(self, min_len: usize) -> (String, Vec<PreTokenizedString>) {
+        let mut pieces = vec![];
+        let mut splits = vec![];
+        let mut len = 0;
+        for split in self.splits {
+            len += split.normalized.len();
+            splits.push(split);
+            if len >= min_len {
+                pieces.push(PreTokenizedString {
+                    original: String::new(),
+                    splits: std::mem::take(&mut splits),
+                });
+                len = 0;
+            }
+        }
+        if !splits.is_empty() {
+            pieces.push(PreTokenizedString {
+                original: String::new(),
+                splits,
+            });
+        }
+        (self.original, pieces)
+    }
+
+    /// Puts back together the pieces `into_pieces` made, in their order.
+    pub(crate) fn from_pieces(original: String, pieces: Vec<PreTokenizedString>) -> Self {
+        Self {
+            original,
+            splits: pieces.into_iter().flat_map(|piece| piece.splits).collect(),
+        }
+    }
+
     /// Transform the current `PreTokenizedString` into an `Encoding`.
     ///
     /// If a `word_idx` is provided, any word in the generated `Encoding`

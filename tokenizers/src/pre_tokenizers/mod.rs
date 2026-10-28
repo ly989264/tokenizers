@@ -59,6 +59,11 @@ impl PreTokenizer for PreTokenizerWrapper {
             Self::FixedLength(fl) => fl.pre_tokenize(normalized),
         }
     }
+
+    fn splits_independently(&self) -> bool {
+        // Every built-in pre-tokenizer works split by split.
+        true
+    }
 }
 
 impl<'de> Deserialize<'de> for PreTokenizerWrapper {

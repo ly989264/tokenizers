@@ -111,6 +111,10 @@ impl PreTokenizer for PyPreTokenizer {
     fn pre_tokenize(&self, normalized: &mut PreTokenizedString) -> tk::Result<()> {
         self.pretok.pre_tokenize(normalized)
     }
+
+    fn splits_independently(&self) -> bool {
+        self.pretok.splits_independently()
+    }
 }
 
 #[pymethods]
@@ -1038,6 +1042,17 @@ impl PreTokenizer for PyPreTokenizerTypeWrapper {
             }),
         }
     }
+
+    fn splits_independently(&self) -> bool {
+        match self {
+            PyPreTokenizerTypeWrapper::Single(inner) => inner
+                .read()
+                .is_ok_and(|inner| inner.splits_independently()),
+            PyPreTokenizerTypeWrapper::Sequence(inner) => inner
+                .iter()
+                .all(|n| n.read().is_ok_and(|n| n.splits_independently())),
+        }
+    }
 }
 
 impl PreTokenizer for PyPreTokenizerWrapper {
@@ -1045,6 +1060,14 @@ impl PreTokenizer for PyPreTokenizerWrapper {
         match self {
             PyPreTokenizerWrapper::Wrapped(inner) => inner.pre_tokenize(pretok),
             PyPreTokenizerWrapper::Custom(inner) => inner.pre_tokenize(pretok),
+        }
+    }
+
+    fn splits_independently(&self) -> bool {
+        // A Python pre-tokenizer sees the whole PreTokenizedString.
+        match self {
+            PyPreTokenizerWrapper::Wrapped(inner) => inner.splits_independently(),
+            PyPreTokenizerWrapper::Custom(_) => false,
         }
     }
 }

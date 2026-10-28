@@ -22,6 +22,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::utils::iter::ResultShunt;
 use crate::utils::parallelism::*;
+
+/// Raw inputs at least this long (in bytes) are pre-tokenized and tokenized in
+/// parallel by `encode_batch_char_offsets`, ...
+const SPLIT_PARALLEL_MIN_LEN: usize = 64 * 1024;
+/// ... in pieces of whole splits holding at least this many bytes.
+const SPLIT_PARALLEL_PIECE_LEN: usize = 16 * 1024;
 use crate::utils::progress::{ProgressBar, ProgressStyle};
 
 mod added_vocabulary;
@@ -64,6 +70,14 @@ pub trait Normalizer: Sync {
 /// the original string.
 pub trait PreTokenizer {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()>;
+
+    /// Whether `pre_tokenize` handles each split of the `PreTokenizedString` on
+    /// its own (only through `PreTokenizedString::split` and `normalize`), so
+    /// that pre-tokenizing the splits a few at a time gives the same result.
+    /// Long inputs are then pre-tokenized in parallel.
+    fn splits_independently(&self) -> bool {
+        false
+    }
 }
 
 /// Represents a model used during Tokenization (like BPE or Word or Unigram).
@@ -1338,7 +1352,7 @@ where
     {
         let mut encodings = inputs
             .into_maybe_par_iter()
-            .map(|input| self.encode_char_offsets(input, add_special_tokens))
+            .map(|input| self.encode_char_offsets_split_parallel(input, add_special_tokens))
             .collect::<Result<Vec<Encoding>>>()?;
 
         if let Some(params) = &self.padding {
@@ -1347,6 +1361,52 @@ where
         }
 
         Ok(encodings)
+    }
+
+    /// `encode_char_offsets`, except that a long single raw input is
+    /// pre-tokenized and tokenized in parallel: the splits made by the added
+    /// tokens (and the normalizer) are processed in pieces of whole splits,
+    /// then put back in order, so the `Encoding` is the same.
+    fn encode_char_offsets_split_parallel<'s, E>(
+        &self,
+        input: E,
+        add_special_tokens: bool,
+    ) -> Result<Encoding>
+    where
+        E: Into<EncodeInput<'s>>,
+    {
+        let input = input.into();
+        if let EncodeInput::Single(InputSequence::Raw(sequence)) = &input {
+            if sequence.len() >= SPLIT_PARALLEL_MIN_LEN
+                && get_parallelism()
+                && self
+                    .pre_tokenizer
+                    .as_ref()
+                    .is_none_or(|pretok| pretok.splits_independently())
+            {
+                let normalized = self
+                    .added_vocabulary
+                    .extract_and_normalize(self.normalizer.as_ref(), sequence);
+                let (original, pieces) = normalized.into_pieces(SPLIT_PARALLEL_PIECE_LEN);
+                let pieces = pieces
+                    .into_maybe_par_iter()
+                    .map(|mut piece| {
+                        if let Some(ref pretok) = self.pre_tokenizer {
+                            pretok.pre_tokenize(&mut piece)?;
+                        }
+                        self.model.tokenize_in_pretokenized(&mut piece)?;
+                        Ok(piece)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let encoding = PreTokenizedString::from_pieces(original, pieces).into_encoding(
+                    None,
+                    0,
+                    OffsetType::Char,
+                )?;
+                return self.post_process(encoding, None, add_special_tokens);
+            }
+        }
+        self.encode_char_offsets(input, add_special_tokens)
     }
 
     /// Encode all the sentences in parallel, using multiple threads
