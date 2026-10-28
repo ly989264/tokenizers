@@ -6,6 +6,7 @@
 extern crate tokenizers as tk;
 
 use once_cell::sync::Lazy;
+use mimalloc::MiMalloc;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -18,6 +19,11 @@ static TOKIO_RUNTIME: Lazy<Arc<Runtime>> = Lazy::new(|| {
         .expect("Failed to create global Tokio runtime");
     Arc::new(rt)
 });
+// Every Rust allocation of the extension (strings, alignments, offsets tables,
+// Encodings) goes through mimalloc instead of the platform allocator.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 mod decoders;
 mod encoding;
 mod error;
