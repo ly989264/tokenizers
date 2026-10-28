@@ -1313,8 +1313,12 @@ where
     where
         E: Into<EncodeInput<'s>> + Send,
     {
+        // A batch of one is encoded on the calling thread: handing it to the
+        // thread pool only adds a wake-up, and its Encoding would be allocated
+        // on a pool thread and freed on the caller's.
+        let parallel = inputs.len() > 1;
         let mut encodings = inputs
-            .into_maybe_par_iter()
+            .into_maybe_par_iter_cond(parallel)
             .map(|input| self.encode(input, add_special_tokens))
             .collect::<Result<Vec<Encoding>>>()?;
 
@@ -1336,8 +1340,12 @@ where
     where
         E: Into<EncodeInput<'s>> + Send,
     {
+        // A batch of one is encoded on the calling thread: handing it to the
+        // thread pool only adds a wake-up, and its Encoding would be allocated
+        // on a pool thread and freed on the caller's.
+        let parallel = inputs.len() > 1;
         let mut encodings = inputs
-            .into_maybe_par_iter()
+            .into_maybe_par_iter_cond(parallel)
             .map(|input| self.encode_char_offsets(input, add_special_tokens))
             .collect::<Result<Vec<Encoding>>>()?;
 
@@ -1358,8 +1366,12 @@ where
     where
         E: Into<EncodeInput<'s>> + Send,
     {
+        // A batch of one is encoded on the calling thread: handing it to the
+        // thread pool only adds a wake-up, and its Encoding would be allocated
+        // on a pool thread and freed on the caller's.
+        let parallel = inputs.len() > 1;
         let mut encodings = inputs
-            .into_maybe_par_iter()
+            .into_maybe_par_iter_cond(parallel)
             .map(|input| self.encode_fast(input, add_special_tokens))
             .collect::<Result<Vec<Encoding>>>()?;
 
