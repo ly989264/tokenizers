@@ -2,8 +2,11 @@ use crate::utils::SysRegex;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::tokenizer::{
-    pattern::Invert, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior,
+    pattern::{Invert, Pattern},
+    Offsets, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior,
 };
+use std::cell::RefCell;
+use std::sync::OnceLock;
 
 /// Represents the different patterns that `Split` can use
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Eq)]
@@ -93,8 +96,140 @@ impl Split {
     }
 }
 
+/// A GPT-family pre-tokenization regex that `bitcannon` reproduces byte for byte (its
+/// parity tests check each grammar against oniguruma). For these patterns the matches
+/// come from its SIMD splitter instead of the regex engine; anything else uses `regex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Native {
+    Gpt2,
+    Cl100k,
+    Qwen,
+    O200k,
+    Tekken,
+    Kimi,
+}
+
+impl Native {
+    fn recognize(pattern: &SplitPattern) -> Option<Self> {
+        use bitcannon::regexes::{CL100K, GPT2, KIMI_K2, O200K, TEKKEN};
+        static QWEN: OnceLock<String> = OnceLock::new();
+        let r = match pattern {
+            SplitPattern::Regex(r) => r.as_str(),
+            SplitPattern::String(_) => return None,
+        };
+        // Without SIMD the splitter is a byte-at-a-time reference, slower than the regex.
+        if !bitcannon::fast_builder() {
+            return None;
+        }
+        // Qwen2 / Qwen3 ship cl100k with a bare `\p{N}`, the form bitcannon's tests use.
+        let qwen = QWEN.get_or_init(|| CL100K.replace(r"\p{N}{1,3}", r"\p{N}"));
+        match r {
+            _ if r == GPT2 => Some(Self::Gpt2),
+            _ if r == CL100K => Some(Self::Cl100k),
+            _ if r == qwen.as_str() => Some(Self::Qwen),
+            _ if r == O200K => Some(Self::O200k),
+            _ if r == TEKKEN => Some(Self::Tekken),
+            _ if r == KIMI_K2 => Some(Self::Kimi),
+            _ => None,
+        }
+    }
+}
+
+/// Reusable buffers for the splitter: one tag per byte, the bitmaps it works on, and
+/// one span per byte plus one.
+#[derive(Default)]
+struct NativeScratch {
+    tags: Vec<u8>,
+    starts: Vec<u64>,
+    flags: Vec<u64>,
+    later: Vec<u64>,
+    spans: Vec<bitcannon::Span>,
+}
+
+thread_local! {
+    static NATIVE_SCRATCH: RefCell<NativeScratch> = RefCell::new(NativeScratch::default());
+}
+
+impl Pattern for &Native {
+    fn find_matches(&self, inside: &str) -> Result<Vec<(Offsets, bool)>> {
+        if inside.is_empty() {
+            return Ok(vec![((0, 0), false)]);
+        }
+        let bytes = inside.as_bytes();
+        let n = bytes.len();
+        NATIVE_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let NativeScratch {
+                tags,
+                starts,
+                flags,
+                later,
+                spans,
+            } = &mut *scratch;
+            let words = n.div_ceil(64) + 1;
+            tags.resize(n.max(tags.len()), 0);
+            starts.resize(words.max(starts.len()), 0);
+            flags.resize(words.max(flags.len()), 0);
+            later.resize((2 * words).max(later.len()), 0);
+            spans.resize((n + 1).max(spans.len()), bitcannon::Span::default());
+            bitcannon::classify::classify(bytes, &mut tags[..n]);
+            let (t, s, f, l, o) = (
+                &tags[..n],
+                &mut starts[..words],
+                &mut flags[..words],
+                &mut later[..2 * words],
+                &mut spans[..n + 1],
+            );
+            let k = match self {
+                Native::Gpt2 => bitcannon::bitcannon_byte_level(bytes, t, s, f, o),
+                Native::Cl100k => bitcannon::bitcannon_cl100k(bytes, t, s, f, o),
+                Native::Qwen => bitcannon::bitcannon_qwen(bytes, t, s, f, o),
+                Native::O200k => bitcannon::bitcannon_o200k(bytes, t, s, f, l, o),
+                Native::Tekken => bitcannon::bitcannon_tekken(bytes, t, s, f, l, o),
+                Native::Kimi => bitcannon::bitcannon_kimi(bytes, t, s, f, l, o),
+            };
+            // Same layout as `&SysRegex`: every match, with any gap between them.
+            let mut prev = 0;
+            let mut splits = Vec::with_capacity(k + 1);
+            for span in &spans[..k] {
+                let (start, end) = (span.start as usize, span.end as usize);
+                if prev != start {
+                    splits.push(((prev, start), false));
+                }
+                splits.push(((start, end), true));
+                prev = end;
+            }
+            if prev != n {
+                splits.push(((prev, n), false));
+            }
+            Ok(splits)
+        })
+    }
+}
+
 impl PreTokenizer for Split {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
+        if let Some(native) = Native::recognize(&self.pattern) {
+            // The splitter's span offsets are u32.
+            let fits = |s: &str| s.len() <= u32::MAX as usize;
+            return if self.invert {
+                pretokenized.split(|_, normalized| {
+                    if fits(normalized.get()) {
+                        normalized.split(Invert(&native), self.behavior)
+                    } else {
+                        normalized.split(Invert(&self.regex), self.behavior)
+                    }
+                })
+            } else {
+                pretokenized.split(|_, normalized| {
+                    if fits(normalized.get()) {
+                        normalized.split(&native, self.behavior)
+                    } else {
+                        normalized.split(&self.regex, self.behavior)
+                    }
+                })
+            };
+        }
         if self.invert {
             pretokenized.split(|_, normalized| normalized.split(Invert(&self.regex), self.behavior))
         } else {
@@ -249,5 +384,40 @@ mod tests {
             r#"{"type":"Split","pattern":{"Regex":"\\s+"},"behavior":"Isolated","invert":false}"#;
         assert_eq!(serde_json::to_string(&split).unwrap(), split_s);
         assert_eq!(serde_json::from_str::<Split>(split_s).unwrap(), split);
+    }
+
+    #[test]
+    fn native_matches_regex() {
+        use bitcannon::regexes::{CL100K, GPT2, KIMI_K2, O200K, TEKKEN};
+        let qwen = CL100K.replace(r"\p{N}{1,3}", r"\p{N}");
+        let texts = [
+            "",
+            "The quick brown fox. Don't 12345 numbers, \u{00BD}\u{00B2}\u{00BC} \u{2168}!",
+            "café × naïve — Привет, наука! Ελλάδα 中文分词。ひらがな カタカナ 한글 مرحبا",
+            "IT'S O'Brien can't 'quoted' l'été rock'n'roll\r\n0 42 999 1000 1234567 v1.2.3",
+            "https://host/a/b?c=1&d=2 path/to//file /\r\n/ ///x CamelCase XMLHttpRequest",
+            "日本語1234テスト ½3¼ #tag @user $9.99 100% end\n\n\nlines\r\n\r\n  \t  trailing   ",
+            "😀👍 hello  world\ttabs\nnewlines   end \u{200d}\u{0301}a\u{0301}b",
+        ];
+        // Every split of a longer text at each char boundary walks the rules across the
+        // splitter's 64-byte blocks.
+        let long: String = texts.concat().repeat(3);
+        let mut inputs: Vec<&str> = texts.to_vec();
+        inputs.extend(long.char_indices().map(|(i, _)| &long[i..]));
+        for pattern in [GPT2, CL100K, qwen.as_str(), O200K, TEKKEN, KIMI_K2] {
+            let split = Split::new(SplitPattern::Regex(pattern.into()), Isolated, false).unwrap();
+            let native = match Native::recognize(&split.pattern) {
+                Some(native) => native,
+                None if !bitcannon::fast_builder() => return,
+                None => panic!("not recognized: {pattern}"),
+            };
+            for text in &inputs {
+                assert_eq!(
+                    (&native).find_matches(text).unwrap(),
+                    (&split.regex).find_matches(text).unwrap(),
+                    "{pattern} on {text:?}"
+                );
+            }
+        }
     }
 }
