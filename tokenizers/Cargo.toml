@@ -71,6 +71,7 @@ name = "ci_benchmark"
 harness = false
 
 [dependencies]
+bitcannon = { path = "bitcannon", version = "0.1.0-rc.3" }
 rand = "0.9"
 onig = { version = "6.5.1", default-features = false, optional = true }
 regex = "1.10"
